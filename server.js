@@ -1,16 +1,17 @@
 // Fano's Trade — backend du formulaire de contact
-// Reçoit les demandes de devis du site et les envoie par e-mail.
+// Reçoit les demandes de devis du site et les envoie par e-mail via l'API Brevo
+// (Render bloque les connexions SMTP sortantes sur son offre gratuite depuis
+// septembre 2025, donc on envoie les e-mails via une requête HTTPS classique
+// au lieu de Nodemailer/SMTP.)
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const nodemailer = require("nodemailer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // -- CORS : n'autorise que le(s) domaine(s) de ton site une fois en ligne.
-// Pendant les tests, "*" fonctionne partout ; à restreindre ensuite.
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map(o => o.trim());
@@ -37,14 +38,38 @@ function isRateLimited(ip) {
   return entry.count > MAX_PER_WINDOW;
 }
 
-// -- Transporteur e-mail (Gmail via mot de passe d'application, voir README)
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER, // ansimakanni10@gmail.com
-    pass: process.env.GMAIL_APP_PASSWORD, // mot de passe d'application (16 caractères)
-  },
-});
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// -- Envoi via l'API HTTPS de Brevo (remplace SMTP)
+async function sendBrevoEmail({ to, subject, html, text, replyTo }) {
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "accept": "application/json",
+      "content-type": "application/json",
+      "api-key": process.env.BREVO_API_KEY,
+    },
+    body: JSON.stringify({
+      sender: { name: "Fano's Trade", email: process.env.SENDER_EMAIL },
+      to: [{ email: to }],
+      ...(replyTo ? { replyTo: { email: replyTo } } : {}),
+      subject,
+      htmlContent: html,
+      textContent: text,
+    }),
+  });
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Brevo API error (${res.status}): ${detail}`);
+  }
+}
 
 app.get("/", (req, res) => {
   res.send("Fano's Trade backend — OK");
@@ -63,7 +88,6 @@ app.post("/api/contact", async (req, res) => {
       return res.status(400).json({ error: "Champs obligatoires manquants." });
     }
 
-    // Validation basique
     const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
     if (!emailOk) {
       return res.status(400).json({ error: "Adresse e-mail invalide." });
@@ -71,8 +95,8 @@ app.post("/api/contact", async (req, res) => {
 
     const destinataire = process.env.NOTIFY_EMAIL || "ansimakanni10@gmail.com";
 
-    await transporter.sendMail({
-      from: `"Site Fano's Trade" <${process.env.GMAIL_USER}>`,
+    // 1. Notification à Fano's Trade
+    await sendBrevoEmail({
       to: destinataire,
       replyTo: email,
       subject: `Nouvelle demande de devis — ${produit}`,
@@ -95,9 +119,8 @@ app.post("/api/contact", async (req, res) => {
       `,
     });
 
-    // Confirmation automatique envoyée au client
-    await transporter.sendMail({
-      from: `"Fano's Trade" <${process.env.GMAIL_USER}>`,
+    // 2. Confirmation automatique envoyée au client
+    await sendBrevoEmail({
       to: email,
       subject: "Nous avons bien reçu votre demande — Fano's Trade",
       text:
@@ -105,6 +128,14 @@ app.post("/api/contact", async (req, res) => {
         `Merci pour votre demande concernant : ${produit}.\n` +
         `Notre équipe vous répond sous 24h ouvrées avec un devis détaillé.\n\n` +
         `À très vite,\nL'équipe Fano's Trade`,
+      html: `
+        <div style="font-family:Arial,sans-serif;font-size:15px;color:#2B2B2B;">
+          <p>Bonjour ${escapeHtml(nom)},</p>
+          <p>Merci pour votre demande concernant : <strong>${escapeHtml(produit)}</strong>.</p>
+          <p>Notre équipe vous répond sous 24h ouvrées avec un devis détaillé.</p>
+          <p>À très vite,<br>L'équipe Fano's Trade</p>
+        </div>
+      `,
     });
 
     res.status(200).json({ ok: true });
@@ -113,14 +144,6 @@ app.post("/api/contact", async (req, res) => {
     res.status(500).json({ error: "Erreur serveur, réessayez plus tard." });
   }
 });
-
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 app.listen(PORT, () => {
   console.log(`Fano's Trade backend en écoute sur le port ${PORT}`);
